@@ -28,7 +28,7 @@ index bfcb7815..9b521703 100644
      if(WIN32 AND NOT DEFINED ENV{VULKAN_SDK} AND EXISTS "C:/VulkanSDK")
          file(GLOB _lus_sdk_dirs LIST_DIRECTORIES true "C:/VulkanSDK/*")
 diff --git a/include/fast/backends/gfx_vulkan.h b/include/fast/backends/gfx_vulkan.h
-index da9c2ed3..89abfb2e 100644
+index da9c2ed3..8e07f04f 100644
 --- a/include/fast/backends/gfx_vulkan.h
 +++ b/include/fast/backends/gfx_vulkan.h
 @@ -14,7 +14,11 @@
@@ -43,6 +43,26 @@ index da9c2ed3..89abfb2e 100644
  #include <unordered_map>
  #include <vector>
  #include <map>
+@@ -238,6 +242,11 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
+         std::vector<VkImageView> garbageViews;
+         std::vector<VkBuffer> garbageBuffers;
+         std::vector<VkDeviceMemory> garbageMemory;
++
++        // Command buffers from commandPool, reused after each pool reset. vkResetCommandPool
++        // does not free them, and the driver walks every one on each reset.
++        std::vector<VkCommandBuffer> commandBuffers;
++        size_t commandBuffersUsed = 0;
+     };
+ 
+     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props);
+@@ -253,6 +262,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
+     VkRenderPass GetRenderPass(uint32_t msaaLevel, bool hasDepth);
+     VkSampler GetSampler(bool linear, uint32_t cms, uint32_t cmt, bool autoMipmap = false);
+     void EnsureUploadCmd();
++    VkCommandBuffer AcquireCommandBuffer();
+     void FlushUploads();
+     // Grow a frame slot's staging buffer to fit an oversized upload (e.g. a 4K HD
+     // replacement = 64 MB > the 32 MB default). Caller must ensure the queue is idle.
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 703dcf65..a5e2ba39 100644
 --- a/src/CMakeLists.txt
@@ -85,7 +105,7 @@ index 9d6a4e75..c94a081e 100644
  #ifdef __MINGW32__
  #define FOR_WINDOWS 1
 diff --git a/src/fast/backends/gfx_vulkan.cpp b/src/fast/backends/gfx_vulkan.cpp
-index d6b65d09..f1c4417a 100644
+index d6b65d09..ceef9341 100644
 --- a/src/fast/backends/gfx_vulkan.cpp
 +++ b/src/fast/backends/gfx_vulkan.cpp
 @@ -19,6 +19,15 @@
@@ -104,7 +124,38 @@ index d6b65d09..f1c4417a 100644
  #include <vector>
  #include <algorithm>
  #include <cstring>
-@@ -763,6 +772,9 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
+@@ -566,15 +575,25 @@ VkSampler GfxRenderingAPIVK::GetSampler(bool linear, uint32_t cms, uint32_t cmt,
+     return sampler;
+ }
+ 
++VkCommandBuffer GfxRenderingAPIVK::AcquireCommandBuffer() {
++    FrameSlot& slot = mFrames[mFrameSlot];
++    if (slot.commandBuffersUsed == slot.commandBuffers.size()) {
++        VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++        ai.commandPool = slot.commandPool;
++        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        ai.commandBufferCount = 1;
++        VkCommandBuffer cmd;
++        VK_CHECK(vkAllocateCommandBuffers(mDevice, &ai, &cmd));
++        slot.commandBuffers.push_back(cmd);
++    }
++    return slot.commandBuffers[slot.commandBuffersUsed++];
++}
++
+ void GfxRenderingAPIVK::EnsureUploadCmd() {
+     if (mUploadCmd != VK_NULL_HANDLE) {
+         return;
+     }
+-    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+-    ai.commandPool = mFrames[mFrameSlot].commandPool;
+-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    ai.commandBufferCount = 1;
+-    VK_CHECK(vkAllocateCommandBuffers(mDevice, &ai, &mUploadCmd));
++    mUploadCmd = AcquireCommandBuffer();
+     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+     VK_CHECK(vkBeginCommandBuffer(mUploadCmd, &bi));
+@@ -763,6 +782,9 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
      SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, instanceExts.data());
  
      uint32_t availExtCount = 0;
@@ -114,7 +165,7 @@ index d6b65d09..f1c4417a 100644
      vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, nullptr);
      std::vector<VkExtensionProperties> availExts(availExtCount);
      vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, availExts.data());
-@@ -791,6 +803,9 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
+@@ -791,6 +813,9 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
          SPDLOG_ERROR("Vulkan: vkCreateInstance failed");
          return false;
      }
@@ -124,7 +175,28 @@ index d6b65d09..f1c4417a 100644
  
      if (!SDL_Vulkan_CreateSurface(window, mInstance, &mSurface)) {
          SPDLOG_ERROR("Vulkan: SDL_Vulkan_CreateSurface failed: {}", SDL_GetError());
-@@ -2302,6 +2317,62 @@ void GfxRenderingAPIVK::EndFrame() {
+@@ -1052,6 +1077,7 @@ void GfxRenderingAPIVK::NewFrame() {
+     }
+     CollectGarbage(slot);
+     VK_CHECK(vkResetCommandPool(mDevice, slot.commandPool, 0));
++    slot.commandBuffersUsed = 0;
+     VK_CHECK(vkResetDescriptorPool(mDevice, slot.descriptorPool, 0));
+ 
+     // Re-create the static set 0 (pool reset destroyed it)
+@@ -1743,11 +1769,7 @@ void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
+     }
+ 
+     if (fb.mCommandBuffer == VK_NULL_HANDLE) {
+-        VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+-        ai.commandPool = mFrames[mFrameSlot].commandPool;
+-        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-        ai.commandBufferCount = 1;
+-        VK_CHECK(vkAllocateCommandBuffers(mDevice, &ai, &fb.mCommandBuffer));
++        fb.mCommandBuffer = AcquireCommandBuffer();
+         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         VK_CHECK(vkBeginCommandBuffer(fb.mCommandBuffer, &bi));
+@@ -2302,6 +2324,62 @@ void GfxRenderingAPIVK::EndFrame() {
          mScreenReadbackDataReady = true;
      }
  
